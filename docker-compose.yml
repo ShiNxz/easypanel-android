@@ -1,0 +1,135 @@
+# Android emulator for Easypanel: the official Android emulator with a Google Play system image (a
+# full virtual machine, so the host needs KVM) and ws-scrcpy-web to see and drive it from a browser
+# with a real mouse pointer (scrcpy 5, UHID). One Easypanel Compose service; see README.md.
+#
+# The ${...} values come from the service's Environment tab ("Create .env file" on). From outside,
+# the screen's only way in is the service's domain, which points at `proxy`, behind Easypanel's
+# basic auth (Security tab). Easypanel puts only `proxy` on its shared `easypanel` Docker network;
+# other apps on the same server reach it there without the basic auth, so turn on ws-scrcpy-web's
+# own login before running any. adb listens on the host's 127.0.0.1 only, on a free port Docker
+# picks: `docker port <project>_<service>-emulator-1 5555` on the host shows it.
+#
+# The phone lives in ../files: emulator-data (the device) and adb (the key it trusts). Back them up
+# with the service stopped; copying them moves the phone. Never run two copies of one phone.
+services:
+  emulator:
+    image: "${EMULATOR_IMAGE:?set EMULATOR_IMAGE}"
+    privileged: true
+    restart: unless-stopped
+    devices:
+      - /dev/kvm:/dev/kvm
+    environment:
+      MEMORY: "${MEMORY:?set MEMORY}"
+      CORES: "${CORES:?set CORES}"
+      SKIP_AUTH: "false"
+      DISABLE_ANIMATION: "true"
+      # Replaces the image's default (-no-metrics -no-audio -partition-size=8192). Add
+      # -partition-size=8192 for 8 GB of storage on a new phone; never change it on an existing
+      # phone without a backup.
+      EXTRA_FLAGS: "${EXTRA_FLAGS:--no-audio -no-metrics -no-boot-anim}"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+          cd /opt
+          # The emulator's modem connects to ::1 and Docker turns IPv6 off in containers.
+          echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6 || true
+          echo 0 > /proc/sys/net/ipv6/conf/lo/disable_ipv6 || true
+          ip -6 addr add fd00::1/128 dev lo 2>/dev/null || true
+          # Google Play images accept adb only from a known key; the viewer gets this one.
+          [ -f /root/.android/adbkey ] || adb keygen /root/.android/adbkey
+          touch /root/.android/repositories.cfg
+          exec /opt/start-emulator.sh
+    volumes:
+      - ../files/emulator-data:/data
+      - ../files/adb:/root/.android
+    ports:
+      - "127.0.0.1::5555"
+
+  # ws-scrcpy-web keeps its state in /data and runs as uid 1000 with HOME=/data/home (its own
+  # entrypoint steps down from root). Before that, as root, this wrapper:
+  #   - gives it the adb key the emulator trusts (the emulator writes it on its first start);
+  #   - turns its app updates off in config.json (the image is pinned; move it on purpose);
+  #   - keeps `adb connect emulator:5555` alive, since nothing reconnects a network device after a
+  #     restart, running as the app's user with its own adb so it talks to the same adb server;
+  #   - once the phone has booted, sets SCREEN_SIZE and SCREEN_DENSITY (empty skips either): fewer
+  #     pixels for the software renderer and the stream to push.
+  web:
+    image: "${VIEWER_IMAGE:?set VIEWER_IMAGE}"
+    restart: unless-stopped
+    depends_on:
+      - emulator
+    environment:
+      WS_SCRCPY_ALLOW_REMOTE_ADMIN: "${WS_SCRCPY_ALLOW_REMOTE_ADMIN:-1}"
+      WS_SCRCPY_SKIP_BOOT_LATEST: "1"
+      SCREEN_SIZE: "${SCREEN_SIZE-720x1280}"
+      SCREEN_DENSITY: "${SCREEN_DENSITY-320}"
+    volumes:
+      - ../files/ws-scrcpy-web:/data
+      - ../files/adb:/keys:ro
+    entrypoint:
+      - /usr/local/bin/tini
+      - -g
+      - --
+      - /bin/sh
+      - -c
+      - |
+          set -e
+          until [ -f /keys/adbkey ]; do echo "[web] waiting for the emulator's adb key"; sleep 2; done
+          mkdir -p /data/home/.android
+          cp /keys/adbkey /data/home/.android/adbkey
+          if [ -f /keys/adbkey.pub ]; then cp /keys/adbkey.pub /data/home/.android/adbkey.pub; fi
+          chmod 600 /data/home/.android/adbkey
+          node -e '
+            const fs = require("fs")
+            const file = "/data/config.json"
+            let config = {}
+            try { config = JSON.parse(fs.readFileSync(file, "utf8")) } catch {}
+            config.autoUpdate = false
+            fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n")
+          '
+          chown -R 1000:1000 /data/home /data/config.json
+          (
+            as_app() {
+              HOME=/data/home setpriv --reuid=1000 --regid=1000 --init-groups --inh-caps=-all -- "$$adb" "$$@"
+            }
+            screen_set=
+            while true; do
+              sleep 15
+              adb=$$(find /data/dependencies -type f -name adb -perm -u+x 2>/dev/null | head -n 1)
+              [ -n "$$adb" ] || continue
+              as_app connect emulator:5555 >/dev/null 2>&1 || true
+              booted=$$(as_app -s emulator:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              if [ -z "$$screen_set" ] && [ "$$booted" = 1 ]; then
+                if [ -n "$$SCREEN_SIZE" ]; then as_app -s emulator:5555 shell wm size "$$SCREEN_SIZE" >/dev/null 2>&1 || true; fi
+                if [ -n "$$SCREEN_DENSITY" ]; then as_app -s emulator:5555 shell wm density "$$SCREEN_DENSITY" >/dev/null 2>&1 || true; fi
+                screen_set=1
+                echo "[web] phone booted; screen $${SCREEN_SIZE:-unchanged} at $${SCREEN_DENSITY:-unchanged} dpi"
+              fi
+            done
+          ) &
+          exec /usr/local/bin/entrypoint.sh "$$@"
+      - --
+    command:
+      - /app/start.sh
+
+  # Easypanel's domain points here. ws-scrcpy-web answers only localhost, IP addresses and host names
+  # listed in its config, and the domain changes (a generated one first, a custom one later), so
+  # Caddy hands it a fixed local Host and Origin. Easypanel's basic auth and the viewer's same-site
+  # token cookie (and its login, when on) still guard every request.
+  proxy:
+    image: caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    restart: unless-stopped
+    depends_on:
+      - web
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - :80
+      - --to
+      - web:8000
+      - --header-up
+      - "Host: 127.0.0.1:8000"
+      - --header-up
+      - "Origin: http://127.0.0.1:8000"

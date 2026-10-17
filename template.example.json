@@ -1,0 +1,34 @@
+{
+  "services": [
+    {
+      "type": "compose",
+      "data": {
+        "serviceName": "android",
+        "source": {
+          "type": "git",
+          "repo": "https://github.com/ShiNxz/easypanel-android.git",
+          "ref": "v1",
+          "rootPath": "/",
+          "composeFile": "docker-compose.yml"
+        },
+        "env": "EMULATOR_IMAGE=halimqarroum/docker-android@sha256:e9cce7930470307477eacdc8768b12838a6265c18c15a92dbca7f7041f98eded\nVIEWER_IMAGE=bilbospocketses/ws-scrcpy-web@sha256:19ca5c13338ab8b841d0049def0c50c6119c6da293d2d813a6e594f149502d72\nMEMORY=6144\nCORES=4\nEXTRA_FLAGS=-no-audio -no-metrics -no-boot-anim\nSCREEN_SIZE=720x1280\nSCREEN_DENSITY=320\nWS_SCRCPY_ALLOW_REMOTE_ADMIN=1",
+        "createDotEnv": true,
+        "domains": [
+          {
+            "host": "$(EASYPANEL_DOMAIN)",
+            "https": true,
+            "port": 80,
+            "path": "/",
+            "service": "proxy"
+          }
+        ],
+        "basicAuth": [
+          {
+            "username": "admin",
+            "password": "REPLACE-WITH-A-LONG-RANDOM-PASSWORD"
+          }
+        ]
+      }
+    }
+  ]
+}
